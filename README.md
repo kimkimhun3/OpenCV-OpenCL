@@ -57,6 +57,6 @@ The focus is on real-time performance for high-resolution video streams, enablin
 - GStreamer と OpenCV を含む PetaLinux 環境  
 - FPGA 開発用 Vitis / Vivado ツールチェーン  
 - OpenCL ランタイム (XRT)  
-- NEXT PLAN
+- NEXT PLAN (Prepare Document)
 
 ---
