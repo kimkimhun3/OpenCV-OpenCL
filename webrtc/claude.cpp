@@ -1,0 +1,410 @@
+// webrtc_sender_vp8.cpp  (WebRTC-only, VP8)
+// Build:
+// g++ -O2 -std=c++17 webrtc_sender_vp8.cpp -o webrtc_sender_vp8 \
+//   $(pkg-config --cflags --libs gstreamer-1.0 gstreamer-webrtc-1.0 \
+//                gstreamer-sdp-1.0 gstreamer-video-1.0 \
+//                glib-2.0 gio-2.0 json-glib-1.0 libsoup-2.4)
+
+#include <gst/gst.h>
+#include <gst/webrtc/webrtc.h>
+#include <gst/sdp/sdp.h>
+#include <glib.h>
+#include <gio/gio.h>
+#include <glib-unix.h>
+#include <libsoup/soup.h>
+#include <json-glib/json-glib.h>
+
+#include <string>
+#include <sstream>
+#include <iostream>
+#include <cstring>
+
+struct App {
+  // GStreamer
+  GMainLoop* loop = nullptr;
+  GstElement* pipeline = nullptr;
+  GstElement* webrtc = nullptr;
+
+  // Signaling (libsoup 2.4)
+  SoupSession* soup = nullptr;
+  SoupMessage* ws_msg = nullptr;
+  SoupWebsocketConnection* ws_conn = nullptr;
+
+  // Video config (matches your gst-launch line)
+  std::string device = "/dev/video0";
+  int width  = 1280;
+  int height = 720;
+  int fps    = 60;
+  int target_bitrate = 25000000; // 25 Mbps (bits per second)
+
+  // Signaling / ICE
+  std::string ws_url = "ws://192.168.25.69:8080";
+  std::string room   = "default";
+  std::string stun   = "stun://stun.l.google.com:19302";
+  std::string turn, turn_user, turn_pass;
+
+  // State
+  bool ws_ready = false;
+  bool offer_sent = false;
+};
+
+static void safe_ws_send(App* app, const char* json_str) {
+  if (!app->ws_conn) return;
+  if (soup_websocket_connection_get_state(app->ws_conn) != SOUP_WEBSOCKET_STATE_OPEN) return;
+  soup_websocket_connection_send_text(app->ws_conn, json_str);
+  g_print("[ws->] %s\n", json_str);
+}
+
+static void send_json_obj(App* app, JsonBuilder* b) {
+  JsonNode* root = json_builder_get_root(b);
+  gchar* text = json_to_string(root, FALSE);
+  safe_ws_send(app, text);
+  g_free(text);
+  json_node_free(root);
+  g_object_unref(b);
+}
+
+static void send_join(App* app) {
+  JsonBuilder* b = json_builder_new();
+  json_builder_begin_object(b);
+  json_builder_set_member_name(b, "type");       json_builder_add_string_value(b, "join");
+  json_builder_set_member_name(b, "room");       json_builder_add_string_value(b, app->room.c_str());
+  json_builder_set_member_name(b, "clientType"); json_builder_add_string_value(b, "sender");
+  json_builder_end_object(b);
+  send_json_obj(app, b);
+}
+
+static void send_ice(App* app, guint mline, const gchar* candidate) {
+  JsonBuilder* b = json_builder_new();
+  json_builder_begin_object(b);
+  json_builder_set_member_name(b, "type");          json_builder_add_string_value(b, "ice-candidate");
+  json_builder_set_member_name(b, "candidate");     json_builder_add_string_value(b, candidate);
+  json_builder_set_member_name(b, "sdpMLineIndex"); json_builder_add_int_value(b, (gint)mline);
+  json_builder_end_object(b);
+  send_json_obj(app, b);
+}
+
+static void on_ice_candidate(GstElement*, guint mline, gchar* candidate, gpointer user_data) {
+  auto* app = static_cast<App*>(user_data);
+  if (!app->ws_ready) return;
+  send_ice(app, mline, candidate);
+}
+
+static void on_offer_created(GstPromise* promise, gpointer user_data) {
+  auto* app = static_cast<App*>(user_data);
+  const GstStructure* reply = gst_promise_get_reply(promise);
+  GstWebRTCSessionDescription* offer = nullptr;
+  gst_structure_get(reply, "offer", GST_TYPE_WEBRTC_SESSION_DESCRIPTION, &offer, NULL);
+  gst_promise_unref(promise);
+
+  g_signal_emit_by_name(app->webrtc, "set-local-description", offer, NULL);
+
+  gchar* sdp_str = gst_sdp_message_as_text(offer->sdp);
+  JsonBuilder* b = json_builder_new();
+  json_builder_begin_object(b);
+  json_builder_set_member_name(b, "type");    json_builder_add_string_value(b, "offer");
+  json_builder_set_member_name(b, "sdp");     json_builder_add_string_value(b, sdp_str);
+  json_builder_set_member_name(b, "sdpType"); json_builder_add_string_value(b, "offer");
+  json_builder_end_object(b);
+  send_json_obj(app, b);
+
+  g_free(sdp_str);
+  gst_webrtc_session_description_free(offer);
+  app->offer_sent = true;
+}
+
+static void create_and_send_offer(App* app) {
+  if (!app->ws_ready || app->offer_sent) return;
+  GstPromise* promise = gst_promise_new_with_change_func(on_offer_created, app, NULL);
+  g_signal_emit_by_name(app->webrtc, "create-offer", NULL, promise);
+}
+
+static void on_negotiation_needed(GstElement*, gpointer user_data) {
+  auto* app = static_cast<App*>(user_data);
+  g_print("on-negotiation-needed\n");
+  if (!app->ws_ready) return;
+  create_and_send_offer(app);
+}
+
+static bool json_member_is_string(JsonObject* obj, const char* name) {
+  return json_object_has_member(obj, name) &&
+         JSON_NODE_HOLDS_VALUE(json_object_get_member(obj, name)) &&
+         json_node_get_value_type(json_object_get_member(obj, name)) == G_TYPE_STRING;
+}
+
+static void handle_answer(App* app, JsonObject* obj) {
+  const char* sdp_text = nullptr;
+  if (json_member_is_string(obj, "sdp")) {
+    sdp_text = json_object_get_string_member(obj, "sdp");
+  } else if (json_object_has_member(obj, "sdp") &&
+             JSON_NODE_HOLDS_OBJECT(json_object_get_member(obj, "sdp"))) {
+    JsonObject* sdp_obj = json_node_get_object(json_object_get_member(obj, "sdp"));
+    if (json_member_is_string(sdp_obj, "sdp")) sdp_text = json_object_get_string_member(sdp_obj, "sdp");
+  }
+  if (!sdp_text) { g_printerr("Answer missing 'sdp'\n"); return; }
+
+  GstSDPMessage* sdp;
+  if (gst_sdp_message_new(&sdp) != GST_SDP_OK) return;
+  if (gst_sdp_message_parse_buffer((guint8*)sdp_text, strlen(sdp_text), sdp) != GST_SDP_OK) {
+    g_printerr("Failed to parse answer SDP\n");
+    gst_sdp_message_free(sdp);
+    return;
+  }
+  GstWebRTCSessionDescription* answer =
+      gst_webrtc_session_description_new(GST_WEBRTC_SDP_TYPE_ANSWER, sdp);
+  g_signal_emit_by_name(app->webrtc, "set-remote-description", answer, NULL);
+  gst_webrtc_session_description_free(answer);
+  g_print("Remote description (answer) set.\n");
+}
+
+static void handle_ice_from_peer(App* app, JsonObject* obj) {
+  const char* cand = nullptr;
+  int mline = 0;
+  if (json_member_is_string(obj, "candidate"))
+    cand = json_object_get_string_member(obj, "candidate");
+  if (json_object_has_member(obj, "sdpMLineIndex") &&
+      JSON_NODE_HOLDS_VALUE(json_object_get_member(obj, "sdpMLineIndex"))) {
+    mline = json_object_get_int_member(obj, "sdpMLineIndex");
+  }
+  if (!cand) return;
+  g_signal_emit_by_name(app->webrtc, "add-ice-candidate", mline, cand);
+}
+
+static gboolean ping_cb(gpointer user_data) {
+  auto* app = static_cast<App*>(user_data);
+  if (!app->ws_conn) return G_SOURCE_CONTINUE;
+  if (soup_websocket_connection_get_state(app->ws_conn) == SOUP_WEBSOCKET_STATE_OPEN) {
+    soup_websocket_connection_send_text(app->ws_conn, "{\"type\":\"ping\"}");
+  }
+  return G_SOURCE_CONTINUE;
+}
+
+static void on_ws_message(SoupWebsocketConnection*,
+                          SoupWebsocketDataType type,
+                          GBytes* message,
+                          gpointer user_data) {
+  auto* app = static_cast<App*>(user_data);
+  if (type != SOUP_WEBSOCKET_DATA_TEXT) return;
+
+  gsize sz = 0;
+  const char* data = (const char*)g_bytes_get_data(message, &sz);
+  g_print("[ws<-] %.*s\n", (int)sz, data);
+
+  JsonParser* p = json_parser_new();
+  GError* jerr = nullptr;
+  if (!json_parser_load_from_data(p, data, sz, &jerr)) {
+    g_printerr("JSON parse error: %s\n", jerr ? jerr->message : "unknown");
+    if (jerr) g_error_free(jerr);
+    g_object_unref(p);
+    return;
+  }
+  JsonNode* root = json_parser_get_root(p);
+  if (!JSON_NODE_HOLDS_OBJECT(root)) { g_object_unref(p); return; }
+  JsonObject* obj = json_node_get_object(root);
+
+  const char* type_str = json_member_is_string(obj, "type")
+                         ? json_object_get_string_member(obj, "type")
+                         : "";
+
+  if (g_strcmp0(type_str, "receiver-joined") == 0) {
+    app->offer_sent = false;
+    create_and_send_offer(app);
+  } else if (g_strcmp0(type_str, "answer") == 0) {
+    handle_answer(app, obj);
+  } else if (g_strcmp0(type_str, "ice-candidate") == 0 || g_strcmp0(type_str, "ice") == 0) {
+    handle_ice_from_peer(app, obj);
+  } else if (g_strcmp0(type_str, "error") == 0) {
+    const char* msg = json_member_is_string(obj, "message")
+                      ? json_object_get_string_member(obj, "message")
+                      : "(no message)";
+    g_printerr("[server error] %s\n", msg);
+  }
+
+  g_object_unref(p);
+}
+
+static void on_ws_closed(SoupWebsocketConnection*, gpointer user_data) {
+  auto* app = static_cast<App*>(user_data);
+  app->ws_ready = false;
+  g_printerr("WebSocket closed.\n");
+  if (app->loop) g_main_loop_quit(app->loop);
+}
+
+static std::string build_pipeline_vp8_webrtc(const App* app) {
+  // v4l2src NV12 → videoconvert → I420 → vp8enc → rtpvp8pay → webrtcbin
+  std::ostringstream ss;
+  ss << "v4l2src device=" << app->device
+     << " ! video/x-raw,format=NV12,width=" << app->width << ",height=" << app->height
+     << ",framerate=" << app->fps << "/1"
+     << " ! queue"
+     << " ! videoconvert"
+     << " ! video/x-raw,format=I420"
+     << " ! vp8enc deadline=1 cpu-used=8 threads=4"
+     << " target-bitrate=" << app->target_bitrate
+     << " error-resilient=1"
+     << " ! rtpvp8pay pt=96"
+     << " ! application/x-rtp,media=video,encoding-name=VP8,payload=96"
+     << " ! webrtcbin name=sendrecv bundle-policy=max-bundle";
+  return ss.str();
+}
+
+static gboolean bus_cb(GstBus*, GstMessage* msg, gpointer user_data) {
+  auto* app = static_cast<App*>(user_data);
+  switch (GST_MESSAGE_TYPE(msg)) {
+    case GST_MESSAGE_ERROR: {
+      GError* e = nullptr; gchar* dbg = nullptr;
+      gst_message_parse_error(msg, &e, &dbg);
+      g_printerr("ERROR: %s (%s)\n", e->message, dbg ? dbg : "");
+      g_clear_error(&e); g_free(dbg);
+      if (app->loop) g_main_loop_quit(app->loop);
+      break;
+    }
+    case GST_MESSAGE_STATE_CHANGED: {
+      if (GST_MESSAGE_SRC(msg) == GST_OBJECT(app->pipeline)) {
+        GstState o,n,p; gst_message_parse_state_changed(msg,&o,&n,&p);
+        g_print("Pipeline state: %s\n", gst_element_state_get_name(n));
+      }
+      break;
+    }
+    default: break;
+  }
+  return TRUE;
+}
+
+static gboolean on_sigint(gpointer user_data) {
+  auto* app = static_cast<App*>(user_data);
+  g_print("Caught SIGINT, shutting down...\n");
+  if (app->loop) g_main_loop_quit(app->loop);
+  return G_SOURCE_REMOVE;
+}
+
+static void on_ws_open(GObject* src, GAsyncResult* res, gpointer user_data) {
+  auto* app = static_cast<App*>(user_data);
+  GError* err = nullptr;
+  app->ws_conn = soup_session_websocket_connect_finish(SOUP_SESSION(src), res, &err);
+  if (!app->ws_conn) {
+    g_printerr("WebSocket connect failed: %s\n", err ? err->message : "unknown");
+    if (err) g_error_free(err);
+    if (app->loop) g_main_loop_quit(app->loop);
+    return;
+  }
+
+  g_print("WebSocket connected successfully\n");
+  g_signal_connect(app->ws_conn, "message", G_CALLBACK(on_ws_message), app);
+  g_signal_connect(app->ws_conn, "closed",  G_CALLBACK(on_ws_closed),  app);
+  app->ws_ready = true;
+
+  // Join as sender
+  send_join(app);
+
+  // Start pipeline if not started
+  gst_element_set_state(app->pipeline, GST_STATE_PLAYING);
+
+  // Create an offer proactively
+  create_and_send_offer(app);
+
+  // Keep WS alive (optional)
+  g_timeout_add_seconds(15, ping_cb, app);
+}
+
+static void parse_args(App* app, int argc, char** argv) {
+  for (int i=1; i<argc; ++i) {
+    std::string arg = argv[i];
+    auto next = [&](int& i)->const char*{ if (i+1<argc) return argv[++i]; return ""; };
+    if      (arg.rfind("--device=",0)==0)   app->device = arg.substr(9);
+    else if (arg=="--device")               app->device = next(i);
+    else if (arg.rfind("--width=",0)==0)    app->width  = std::stoi(arg.substr(8));
+    else if (arg=="--width")                app->width  = std::stoi(next(i));
+    else if (arg.rfind("--height=",0)==0)   app->height = std::stoi(arg.substr(9));
+    else if (arg=="--height")               app->height = std::stoi(next(i));
+    else if (arg.rfind("--fps=",0)==0)      app->fps    = std::stoi(arg.substr(6));
+    else if (arg=="--fps")                  app->fps    = std::stoi(next(i));
+    else if (arg.rfind("--bitrate=",0)==0)  app->target_bitrate = std::stoi(arg.substr(10));
+    else if (arg=="--bitrate")              app->target_bitrate = std::stoi(next(i));
+
+    else if (arg.rfind("--ws=",0)==0)       app->ws_url = arg.substr(5);
+    else if (arg=="--ws")                   app->ws_url = next(i);
+    else if (arg.rfind("--room=",0)==0)     app->room   = arg.substr(7);
+    else if (arg=="--room")                 app->room   = next(i);
+
+    else if (arg.rfind("--stun=",0)==0)     app->stun = arg.substr(7);
+    else if (arg=="--stun")                 app->stun = next(i);
+    else if (arg.rfind("--turn=",0)==0)     app->turn = arg.substr(7);
+    else if (arg=="--turn")                 app->turn = next(i);
+    else if (arg.rfind("--turn-username=",0)==0) app->turn_user = arg.substr(16);
+    else if (arg=="--turn-username")              app->turn_user = next(i);
+    else if (arg.rfind("--turn-password=",0)==0) app->turn_pass = arg.substr(16);
+    else if (arg=="--turn-password")              app->turn_pass = next(i);
+  }
+}
+
+int main(int argc, char** argv) {
+  gst_init(&argc, &argv);
+
+  App app;
+  parse_args(&app, argc, argv);
+  app.loop = g_main_loop_new(NULL, FALSE);
+
+  // Build VP8 WebRTC pipeline
+  std::string pipeline_str = build_pipeline_vp8_webrtc(&app);
+  g_print("Pipeline: %s\n", pipeline_str.c_str());
+  GError* perr = nullptr;
+  app.pipeline = gst_parse_launch(pipeline_str.c_str(), &perr);
+  if (!app.pipeline) {
+    g_printerr("Failed to create pipeline: %s\n", perr ? perr->message : "unknown");
+    if (perr) g_error_free(perr);
+    return -1;
+  }
+
+  // webrtcbin
+  app.webrtc = gst_bin_get_by_name(GST_BIN(app.pipeline), "sendrecv");
+
+  // ICE servers
+  if (!app.stun.empty()) g_object_set(app.webrtc, "stun-server", app.stun.c_str(), NULL);
+  if (!app.turn.empty()) {
+    std::string turn_uri = app.turn;
+    if (!app.turn_user.empty() || !app.turn_pass.empty()) {
+      std::string scheme, hostport;
+      auto pos = turn_uri.find("://");
+      if (pos != std::string::npos) { scheme = turn_uri.substr(0,pos+3); hostport = turn_uri.substr(pos+3); }
+      else { scheme = "turn://"; hostport = turn_uri; }
+      turn_uri = scheme + app.turn_user + ":" + app.turn_pass + "@" + hostport;
+    }
+    g_object_set(app.webrtc, "turn-server", turn_uri.c_str(), NULL);
+  }
+
+  // Hook WebRTC signals
+  g_signal_connect(app.webrtc, "on-negotiation-needed", G_CALLBACK(on_negotiation_needed), &app);
+  g_signal_connect(app.webrtc, "on-ice-candidate",      G_CALLBACK(on_ice_candidate),      &app);
+
+  // Bus logging
+  GstBus* bus = gst_element_get_bus(app.pipeline);
+  gst_bus_add_watch(bus, bus_cb, &app);
+  gst_object_unref(bus);
+
+  // Start PAUSED; go PLAYING after WS is connected
+  gst_element_set_state(app.pipeline, GST_STATE_PAUSED);
+
+  // Ctrl+C
+  g_unix_signal_add(SIGINT, on_sigint, &app);
+
+  // Connect WebSocket to signaling server
+  app.soup = soup_session_new();
+  app.ws_msg = soup_message_new(SOUP_METHOD_GET, app.ws_url.c_str());
+  g_print("Connecting to signaling server: %s\n", app.ws_url.c_str());
+  soup_session_websocket_connect_async(
+      app.soup, app.ws_msg,
+      NULL, NULL, NULL,
+      on_ws_open, &app);
+
+  g_main_loop_run(app.loop);
+
+  // Cleanup
+  if (app.ws_conn) soup_websocket_connection_close(app.ws_conn, SOUP_WEBSOCKET_CLOSE_NORMAL, NULL);
+  if (app.pipeline) { gst_element_set_state(app.pipeline, GST_STATE_NULL); gst_object_unref(app.pipeline); }
+  if (app.webrtc) gst_object_unref(app.webrtc);
+  if (app.ws_msg) g_object_unref(app.ws_msg);
+  if (app.soup) g_object_unref(app.soup);
+  if (app.loop) g_main_loop_unref(app.loop);
+  return 0;
+}

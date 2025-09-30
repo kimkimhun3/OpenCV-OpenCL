@@ -1,0 +1,615 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>MPSoC WebRTC Video Receiver</title>
+    <style>
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            margin: 0;
+            padding: 20px;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            min-height: 100vh;
+            color: white;
+        }
+
+        .container {
+            max-width: 1200px;
+            margin: 0 auto;
+            background: rgba(255, 255, 255, 0.1);
+            backdrop-filter: blur(10px);
+            border-radius: 20px;
+            padding: 30px;
+            box-shadow: 0 8px 32px rgba(0, 0, 0, 0.1);
+        }
+
+        h1 {
+            text-align: center;
+            margin-bottom: 30px;
+            font-size: 2.5em;
+            font-weight: 300;
+            text-shadow: 0 2px 10px rgba(0, 0, 0, 0.3);
+        }
+
+        .video-container {
+            position: relative;
+            width: 100%;
+            max-width: 800px;
+            margin: 0 auto 30px;
+            background: rgba(0, 0, 0, 0.3);
+            border-radius: 15px;
+            overflow: hidden;
+            box-shadow: 0 10px 40px rgba(0, 0, 0, 0.3);
+        }
+
+        #remoteVideo {
+            width: 100%;
+            height: auto;
+            min-height: 400px;
+            object-fit: contain;
+            background: #000;
+        }
+
+        .video-overlay {
+            position: absolute;
+            top: 50%;
+            left: 50%;
+            transform: translate(-50%, -50%);
+            text-align: center;
+            z-index: 10;
+            pointer-events: none;
+        }
+
+        .video-overlay.hidden {
+            display: none;
+        }
+
+        .loading-spinner {
+            width: 50px;
+            height: 50px;
+            border: 3px solid rgba(255, 255, 255, 0.3);
+            border-radius: 50%;
+            border-top-color: #fff;
+            animation: spin 1s ease-in-out infinite;
+            margin: 0 auto 20px;
+        }
+
+        @keyframes spin {
+            to { transform: rotate(360deg); }
+        }
+
+        .controls {
+            display: flex;
+            gap: 15px;
+            justify-content: center;
+            flex-wrap: wrap;
+            margin-bottom: 30px;
+        }
+
+        button {
+            padding: 12px 24px;
+            border: none;
+            border-radius: 25px;
+            background: rgba(255, 255, 255, 0.2);
+            color: white;
+            cursor: pointer;
+            font-size: 16px;
+            font-weight: 500;
+            transition: all 0.3s ease;
+            backdrop-filter: blur(10px);
+            border: 1px solid rgba(255, 255, 255, 0.3);
+        }
+
+        button:hover {
+            background: rgba(255, 255, 255, 0.3);
+            transform: translateY(-2px);
+            box-shadow: 0 5px 15px rgba(0, 0, 0, 0.2);
+        }
+
+        button:disabled {
+            opacity: 0.5;
+            cursor: not-allowed;
+            transform: none;
+        }
+
+        .status {
+            text-align: center;
+            padding: 20px;
+            background: rgba(0, 0, 0, 0.2);
+            border-radius: 10px;
+            margin-bottom: 20px;
+        }
+
+        .status.connected {
+            background: rgba(76, 175, 80, 0.3);
+        }
+
+        .status.error {
+            background: rgba(244, 67, 54, 0.3);
+        }
+
+        .info-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
+            gap: 20px;
+            margin-top: 20px;
+        }
+
+        .info-card {
+            background: rgba(255, 255, 255, 0.1);
+            padding: 20px;
+            border-radius: 10px;
+            backdrop-filter: blur(5px);
+        }
+
+        .info-card h3 {
+            margin: 0 0 15px 0;
+            font-size: 1.2em;
+            opacity: 0.9;
+        }
+
+        .info-card p {
+            margin: 5px 0;
+            font-family: 'Courier New', monospace;
+            font-size: 0.9em;
+            opacity: 0.8;
+        }
+
+        .hidden {
+            display: none !important;
+        }
+
+        @media (max-width: 768px) {
+            .container {
+                padding: 20px;
+            }
+            
+            h1 {
+                font-size: 2em;
+            }
+            
+            .controls {
+                flex-direction: column;
+                align-items: center;
+            }
+            
+            button {
+                width: 200px;
+            }
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>📽️ MPSoC WebRTC Stream</h1>
+        
+        <div id="status" class="status">
+            <strong>Status:</strong> <span id="statusText">Connecting to signaling server...</span>
+        </div>
+
+        <div class="video-container">
+            <video id="remoteVideo" autoplay playsinline muted></video>
+            <div id="videoOverlay" class="video-overlay">
+                <div class="loading-spinner"></div>
+                <h3>Waiting for video stream...</h3>
+                <p>Make sure your MPSoC device is running and connected</p>
+            </div>
+        </div>
+
+        <div class="controls">
+            <button id="connectBtn">Connect to Stream</button>
+            <button id="disconnectBtn" disabled>Disconnect</button>
+            <button id="fullscreenBtn" disabled>Fullscreen</button>
+            <button id="statsBtn">Show Stats</button>
+        </div>
+
+        <div id="statsContainer" class="info-grid hidden">
+            <div class="info-card">
+                <h3>Connection Info</h3>
+                <p id="connectionState">Connection: Not connected</p>
+                <p id="iceConnectionState">ICE: Not connected</p>
+                <p id="signalingState">Signaling: Not connected</p>
+            </div>
+            <div class="info-card">
+                <h3>Video Stats</h3>
+                <p id="videoResolution">Resolution: Unknown</p>
+                <p id="videoFramerate">Framerate: Unknown</p>
+                <p id="videoBitrate">Bitrate: Unknown</p>
+            </div>
+            <div class="info-card">
+                <h3>Network Stats</h3>
+                <p id="bytesReceived">Bytes Received: 0</p>
+                <p id="packetsReceived">Packets Received: 0</p>
+                <p id="packetsLost">Packets Lost: 0</p>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        class WebRTCReceiver {
+            constructor() {
+                this.ws = null;
+                this.pc = null;
+                this.clientId = null;
+                this.isConnected = false;
+                this.statsInterval = null;
+                
+                this.initializeElements();
+                this.setupEventListeners();
+                this.connect();
+            }
+
+            initializeElements() {
+                this.elements = {
+                    video: document.getElementById('remoteVideo'),
+                    overlay: document.getElementById('videoOverlay'),
+                    status: document.getElementById('status'),
+                    statusText: document.getElementById('statusText'),
+                    connectBtn: document.getElementById('connectBtn'),
+                    disconnectBtn: document.getElementById('disconnectBtn'),
+                    fullscreenBtn: document.getElementById('fullscreenBtn'),
+                    statsBtn: document.getElementById('statsBtn'),
+                    statsContainer: document.getElementById('statsContainer')
+                };
+            }
+
+            setupEventListeners() {
+                this.elements.connectBtn.addEventListener('click', () => this.connect());
+                this.elements.disconnectBtn.addEventListener('click', () => this.disconnect());
+                this.elements.fullscreenBtn.addEventListener('click', () => this.toggleFullscreen());
+                this.elements.statsBtn.addEventListener('click', () => this.toggleStats());
+                
+                this.elements.video.addEventListener('loadedmetadata', () => {
+                    console.log('Video metadata loaded');
+                    this.elements.overlay.classList.add('hidden');
+                    this.elements.fullscreenBtn.disabled = false;
+                });
+
+                this.elements.video.addEventListener('play', () => {
+                    console.log('Video started playing');
+                });
+            }
+
+            connect() {
+                if (this.ws && this.ws.readyState === WebSocket.OPEN) {
+                    return;
+                }
+
+                this.updateStatus('Connecting to signaling server...', 'connecting');
+                
+                // FIXED: Use the correct IP address that matches your C++ sender
+                const wsUrl = `ws://192.168.25.69:8080`;
+                console.log('Connecting to:', wsUrl);
+                this.ws = new WebSocket(wsUrl);
+
+                this.ws.onopen = () => {
+                    console.log('WebSocket connected');
+                    this.updateStatus('Connected to signaling server', 'connected');
+                    
+                    // Join as receiver
+                    this.send({
+                        type: 'join',
+                        room: 'default',
+                        clientType: 'receiver'
+                    });
+                };
+
+                this.ws.onmessage = (event) => {
+                    const message = JSON.parse(event.data);
+                    console.log('Received:', message);
+                    this.handleSignalingMessage(message);
+                };
+
+                this.ws.onclose = () => {
+                    console.log('WebSocket disconnected');
+                    this.updateStatus('Disconnected from server', 'error');
+                    this.isConnected = false;
+                    this.updateButtons();
+                };
+
+                this.ws.onerror = (error) => {
+                    console.error('WebSocket error:', error);
+                    this.updateStatus('Connection error', 'error');
+                };
+            }
+
+            disconnect() {
+                if (this.pc) {
+                    this.pc.close();
+                    this.pc = null;
+                }
+                
+                if (this.ws) {
+                    this.ws.close();
+                    this.ws = null;
+                }
+
+                if (this.statsInterval) {
+                    clearInterval(this.statsInterval);
+                    this.statsInterval = null;
+                }
+
+                this.elements.video.srcObject = null;
+                this.elements.overlay.classList.remove('hidden');
+                this.isConnected = false;
+                this.updateButtons();
+                this.updateStatus('Disconnected', 'error');
+            }
+
+            async handleSignalingMessage(message) {
+                console.log('Received message:', message.type, message);
+
+                switch (message.type) {
+                    case 'connected':
+                        this.clientId = message.clientId;
+                        break;
+                        
+                    case 'joined':
+                        this.updateStatus(`Joined room as ${message.clientType}`, 'connected');
+                        break;
+                        
+                    case 'offer':
+                        console.log('Received offer');
+                        await this.handleOffer(message);
+                        break;
+                        
+                    case 'ice-candidate':
+                        console.log('Received ICE candidate');
+                        await this.handleIceCandidate(message);
+                        break;
+                        
+                    case 'sender-left':
+                        this.updateStatus('Sender disconnected', 'error');
+                        this.elements.video.srcObject = null;
+                        this.elements.overlay.classList.remove('hidden');
+                        break;
+                        
+                    case 'error':
+                        console.error('Server error:', message.message);
+                        this.updateStatus(`Error: ${message.message}`, 'error');
+                        break;
+                }
+            }
+
+            async handleOffer(message) {
+                try {
+                    if (!this.pc) {
+                        await this.createPeerConnection();
+                    }
+
+                    // Handle the offer format (could be string or object)
+                    const offerInit = (typeof message.sdp === 'string')
+                        ? { type: 'offer', sdp: message.sdp }
+                        : message.sdp;
+
+                    console.log('Setting remote description with offer');
+                    
+                    // If we're not in stable state, rollback first
+                    if (this.pc.signalingState !== 'stable') {
+                        console.log('Rolling back from state:', this.pc.signalingState);
+                        try {
+                            await this.pc.setLocalDescription({ type: 'rollback' });
+                        } catch (e) {
+                            console.log('Rollback failed (ok):', e.message);
+                        }
+                    }
+
+                    await this.pc.setRemoteDescription(offerInit);
+                    console.log('Remote description set, creating answer');
+                    
+                    const answer = await this.pc.createAnswer();
+                    await this.pc.setLocalDescription(answer);
+                    
+                    console.log('Sending answer');
+                    this.send({
+                        type: 'answer',
+                        sdp: answer.sdp  // Send as string directly
+                    });
+                    
+                    this.updateStatus('Negotiated, waiting for video...', 'connected');
+                } catch (error) {
+                    console.error('Error handling offer:', error);
+                    this.updateStatus('Failed to negotiate connection', 'error');
+                }
+            }
+
+            async handleIceCandidate(message) {
+                if (this.pc && message.candidate) {
+                    try {
+                        console.log('Adding ICE candidate:', message.candidate);
+                        await this.pc.addIceCandidate(new RTCIceCandidate({
+                            candidate: message.candidate,
+                            sdpMLineIndex: message.sdpMLineIndex,
+                            sdpMid: message.sdpMid
+                        }));
+                    } catch (error) {
+                        console.error('Error adding ICE candidate:', error);
+                    }
+                }
+            }
+
+            async createPeerConnection() {
+                console.log('Creating peer connection');
+                const configuration = {
+                    iceServers: [
+                        { urls: 'stun:stun.l.google.com:19302' },
+                        { urls: 'stun:stun1.l.google.com:19302' }
+                    ]
+                };
+
+                this.pc = new RTCPeerConnection(configuration);
+
+                this.pc.onicecandidate = (event) => {
+                    if (event.candidate) {
+                        console.log('Sending ICE candidate');
+                        this.send({
+                            type: 'ice-candidate',
+                            candidate: event.candidate.candidate,
+                            sdpMLineIndex: event.candidate.sdpMLineIndex,
+                            sdpMid: event.candidate.sdpMid
+                        });
+                    } else {
+                        console.log('ICE gathering complete');
+                    }
+                };
+
+                this.pc.ontrack = (event) => {
+                    console.log('Received remote track:', event.track.kind);
+                    if (event.track.kind === 'video') {
+                        console.log('Setting video stream');
+                        this.elements.video.srcObject = event.streams[0];
+                        this.updateStatus('Video stream received!', 'connected');
+                        this.isConnected = true;
+                        this.updateButtons();
+                        this.startStatsCollection();
+                    }
+                };
+
+                this.pc.onconnectionstatechange = () => {
+                    console.log('Connection state:', this.pc.connectionState);
+                    this.updateConnectionStats();
+                    
+                    if (this.pc.connectionState === 'failed') {
+                        this.updateStatus('Connection failed', 'error');
+                    } else if (this.pc.connectionState === 'connected') {
+                        this.updateStatus('Connected and streaming', 'connected');
+                    }
+                };
+
+                this.pc.oniceconnectionstatechange = () => {
+                    console.log('ICE connection state:', this.pc.iceConnectionState);
+                    this.updateConnectionStats();
+                };
+
+                this.pc.onsignalingstatechange = () => {
+                    console.log('Signaling state:', this.pc.signalingState);
+                    this.updateConnectionStats();
+                };
+            }
+
+            send(message) {
+                if (this.ws && this.ws.readyState === WebSocket.OPEN) {
+                    console.log('Sending:', message);
+                    this.ws.send(JSON.stringify(message));
+                }
+            }
+
+            updateStatus(text, type = 'default') {
+                this.elements.statusText.textContent = text;
+                this.elements.status.className = `status ${type}`;
+            }
+
+            updateButtons() {
+                this.elements.connectBtn.disabled = this.isConnected;
+                this.elements.disconnectBtn.disabled = !this.isConnected;
+            }
+
+            toggleFullscreen() {
+                if (document.fullscreenElement) {
+                    document.exitFullscreen();
+                } else {
+                    this.elements.video.requestFullscreen().catch(err => {
+                        console.error('Error entering fullscreen:', err);
+                    });
+                }
+            }
+
+            toggleStats() {
+                const isHidden = this.elements.statsContainer.classList.contains('hidden');
+                this.elements.statsContainer.classList.toggle('hidden');
+                this.elements.statsBtn.textContent = isHidden ? 'Hide Stats' : 'Show Stats';
+            }
+
+            updateConnectionStats() {
+                if (!this.pc) return;
+
+                document.getElementById('connectionState').textContent = 
+                    `Connection: ${this.pc.connectionState || 'Unknown'}`;
+                document.getElementById('iceConnectionState').textContent = 
+                    `ICE: ${this.pc.iceConnectionState || 'Unknown'}`;
+                document.getElementById('signalingState').textContent = 
+                    `Signaling: ${this.pc.signalingState || 'Unknown'}`;
+            }
+
+            startStatsCollection() {
+                if (this.statsInterval) {
+                    clearInterval(this.statsInterval);
+                }
+
+                this.statsInterval = setInterval(async () => {
+                    if (!this.pc) return;
+
+                    try {
+                        const stats = await this.pc.getStats();
+                        this.updateVideoStats(stats);
+                    } catch (error) {
+                        console.error('Error getting stats:', error);
+                    }
+                }, 1000);
+            }
+
+            updateVideoStats(stats) {
+                let bytesReceived = 0;
+                let packetsReceived = 0;
+                let packetsLost = 0;
+                let frameWidth = 0;
+                let frameHeight = 0;
+                let framesPerSecond = 0;
+
+                stats.forEach((report) => {
+                    if (report.type === 'inbound-rtp' && report.mediaType === 'video') {
+                        bytesReceived = report.bytesReceived || 0;
+                        packetsReceived = report.packetsReceived || 0;
+                        packetsLost = report.packetsLost || 0;
+                        frameWidth = report.frameWidth || 0;
+                        frameHeight = report.frameHeight || 0;
+                        framesPerSecond = report.framesPerSecond || 0;
+                    }
+                });
+
+                // Update video info
+                if (frameWidth && frameHeight) {
+                    document.getElementById('videoResolution').textContent = 
+                        `Resolution: ${frameWidth}x${frameHeight}`;
+                }
+                
+                if (framesPerSecond) {
+                    document.getElementById('videoFramerate').textContent = 
+                        `Framerate: ${framesPerSecond.toFixed(1)} fps`;
+                }
+
+                // Calculate bitrate
+                if (this.lastBytesReceived !== undefined) {
+                    const bytesDelta = bytesReceived - this.lastBytesReceived;
+                    const bitrate = (bytesDelta * 8) / 1000; // kbps
+                    document.getElementById('videoBitrate').textContent = 
+                        `Bitrate: ${bitrate.toFixed(1)} kbps`;
+                }
+                this.lastBytesReceived = bytesReceived;
+
+                // Update network stats
+                document.getElementById('bytesReceived').textContent = 
+                    `Bytes Received: ${this.formatBytes(bytesReceived)}`;
+                document.getElementById('packetsReceived').textContent = 
+                    `Packets Received: ${packetsReceived.toLocaleString()}`;
+                document.getElementById('packetsLost').textContent = 
+                    `Packets Lost: ${packetsLost.toLocaleString()}`;
+            }
+
+            formatBytes(bytes) {
+                if (bytes === 0) return '0 B';
+                const k = 1024;
+                const sizes = ['B', 'KB', 'MB', 'GB'];
+                const i = Math.floor(Math.log(bytes) / Math.log(k));
+                return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + ' ' + sizes[i];
+            }
+        }
+
+        // Initialize the WebRTC receiver when page loads
+        document.addEventListener('DOMContentLoaded', () => {
+            new WebRTCReceiver();
+        });
+    </script>
+</body>
+</html>
