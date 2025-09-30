@@ -241,7 +241,7 @@ static GstFlowReturn new_sample_cb(GstAppSink *appsink, gpointer user_data) {
             gst_buffer_unref(out);
         }
 
-        // End total frame timing
+        // End total frame timing DONE
         auto frame_end = std::chrono::high_resolution_clock::now();
         double total_frame_ms = std::chrono::duration<double, std::milli>(frame_end - frame_start).count();
         

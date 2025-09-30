@@ -25,7 +25,7 @@ The focus is on real-time performance for high-resolution video streams, enablin
 - Xilinx MPSoC board (e.g., ZCU106)  
 - PetaLinux environment with GStreamer and OpenCV  
 - Vitis/Vivado toolchain for FPGA development  
-- OpenCL runtime (XRT)  
+- OpenCL runtime (XRT)  (No selected)
 
 ---
 
@@ -57,6 +57,10 @@ The focus is on real-time performance for high-resolution video streams, enablin
 - GStreamer と OpenCV を含む PetaLinux 環境  
 - FPGA 開発用 Vitis / Vivado ツールチェーン  
 - OpenCL ランタイム (XRT)  
+<<<<<<< HEAD
 - NEXT PLAN 
+=======
+- NEXT PLAN (Prepare Document)
+>>>>>>> 201f8140d56ff61d4b67dab77fe6354609ec9f95
 
 ---
